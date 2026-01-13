@@ -222,15 +222,18 @@ def send_email(config, subject, body):
             region_name=config["aws_region"]
         )
 
+        # Support multiple recipients (comma-separated)
+        recipients = [e.strip() for e in config["email_to"].split(",")]
+
         ses.send_email(
             Source=config["email_from"],
-            Destination={"ToAddresses": [config["email_to"]]},
+            Destination={"ToAddresses": recipients},
             Message={
                 "Subject": {"Data": subject, "Charset": "UTF-8"},
                 "Body": {"Text": {"Data": body, "Charset": "UTF-8"}}
             }
         )
-        print(f"  Email sent to {config['email_to']}")
+        print(f"  Email sent to {', '.join(recipients)}")
         return True
 
     except Exception as e:
