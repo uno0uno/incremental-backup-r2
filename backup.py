@@ -45,6 +45,13 @@ def load_env():
         # Retention
         "keep_local_days": int(os.environ.get("KEEP_LOCAL_DAYS", "7")),
         "keep_remote_days": int(os.environ.get("KEEP_REMOTE_DAYS", "30")),
+
+        # AWS SES config
+        "aws_access_key": os.environ.get("AWS_ACCESS_KEY_ID"),
+        "aws_secret_key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        "aws_region": os.environ.get("AWS_REGION", "us-west-1"),
+        "email_from": os.environ.get("EMAIL_FROM"),
+        "email_to": os.environ.get("EMAIL_TO"),
     }
 
 
@@ -199,6 +206,38 @@ def cleanup_local(config):
         print(f"  Removed {removed} old local backup(s)")
 
 
+def send_email(config, subject, body):
+    """Send email notification via AWS SES."""
+    if not all([config["aws_access_key"], config["aws_secret_key"], config["email_from"], config["email_to"]]):
+        print("  Email not configured, skipping")
+        return False
+
+    try:
+        import boto3
+
+        ses = boto3.client(
+            "ses",
+            aws_access_key_id=config["aws_access_key"],
+            aws_secret_access_key=config["aws_secret_key"],
+            region_name=config["aws_region"]
+        )
+
+        ses.send_email(
+            Source=config["email_from"],
+            Destination={"ToAddresses": [config["email_to"]]},
+            Message={
+                "Subject": {"Data": subject, "Charset": "UTF-8"},
+                "Body": {"Text": {"Data": body, "Charset": "UTF-8"}}
+            }
+        )
+        print(f"  Email sent to {config['email_to']}")
+        return True
+
+    except Exception as e:
+        print(f"  Email failed: {e}")
+        return False
+
+
 def cleanup_r2(config):
     """Remove old R2 backups."""
     if not all([config["r2_account_id"], config["r2_access_key"], config["r2_secret_key"], config["r2_bucket"]]):
@@ -280,12 +319,18 @@ def run_backup(force=False):
 
     config = load_env()
     state = load_state()
+    backup_result = {"success": False, "uploaded": False, "file": None, "size": 0, "error": None}
 
     # Create backup
     backup_path = create_backup(config)
     if not backup_path:
         print("\nBACKUP FAILED!")
+        backup_result["error"] = "Failed to create backup"
+        send_backup_report(config, backup_result)
         return False
+
+    backup_result["file"] = backup_path.name
+    backup_result["size"] = backup_path.stat().st_size / (1024 * 1024)
 
     # Check changes
     needs_upload, current_hash = check_changes(backup_path, state)
@@ -304,19 +349,69 @@ def run_backup(force=False):
                 "timestamp": datetime.now().isoformat()
             })
             state["backups"] = state["backups"][-100:]
+            backup_result["uploaded"] = True
+            backup_result["r2_key"] = r2_key
+        else:
+            backup_result["error"] = "Upload to R2 failed"
 
         save_state(state)
         print("\nBackup completed!")
+        backup_result["success"] = True
     else:
         backup_path.unlink()
         print("\nSkipped (no changes)")
+        backup_result["success"] = True
+        backup_result["skipped"] = True
 
     # Cleanup
     print("\nCleanup:")
     cleanup_local(config)
     cleanup_r2(config)
 
+    # Send email report
+    print("\nEmail report:")
+    send_backup_report(config, backup_result)
+
     return True
+
+
+def send_backup_report(config, result):
+    """Send backup report via email."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db_name = config.get("db_name", "unknown")
+
+    if result.get("error"):
+        subject = f"[BACKUP FAILED] {db_name} - {timestamp}"
+        body = f"""BACKUP FAILED
+
+Database: {db_name}
+Time: {timestamp}
+Error: {result['error']}
+
+Please check the backup system immediately.
+"""
+    elif result.get("skipped"):
+        subject = f"[BACKUP OK] {db_name} - No changes"
+        body = f"""BACKUP SKIPPED (No changes detected)
+
+Database: {db_name}
+Time: {timestamp}
+
+No changes since last backup. Database hash unchanged.
+"""
+    else:
+        subject = f"[BACKUP OK] {db_name} - {result.get('size', 0):.2f} MB"
+        body = f"""BACKUP COMPLETED SUCCESSFULLY
+
+Database: {db_name}
+Time: {timestamp}
+File: {result.get('file', 'N/A')}
+Size: {result.get('size', 0):.2f} MB
+Uploaded to R2: {'Yes' if result.get('uploaded') else 'No'}
+R2 Location: {result.get('r2_key', 'N/A')}
+"""
+
+    send_email(config, subject, body)
 
 
 if __name__ == "__main__":
